@@ -57,7 +57,15 @@ export async function email(message, env, ctx) {
 			return;
 		}
 
-		const account = await accountService.selectByEmailIncludeDel({ env: env }, message.to);
+		let account = await accountService.selectByEmailIncludeDel({ env: env }, message.to);
+
+		// 管理员Catch-All：当收件地址无对应账户时，将邮件路由至管理员账户
+		if (!account && env.admin) {
+			const adminAccount = await accountService.selectByEmailIncludeDel({ env: env }, env.admin);
+			if (adminAccount) {
+				account = adminAccount;
+			}
+		}
 
 		if (!account && noRecipient === settingConst.noRecipient.CLOSE) {
 			message.setReject('Recipient not found');

@@ -552,6 +552,12 @@ const emailService = {
 		const userIds = accountList.map(accountRow => accountRow.userId);
 		let roleList = await roleService.selectByUserIds(c, userIds);
 
+		// 管理员Catch-All：预加载管理员账户，用于路由无匹配收件人的邮件
+		let adminAccount = null;
+		if (c.env.admin) {
+			adminAccount = await accountService.selectByEmailIncludeDel(c, c.env.admin);
+		}
+
 		//封装数据库准备保存到数据库
 		const emailDataList = [];
 
@@ -597,16 +603,24 @@ const emailService = {
 
 			} else {
 
-				//设置无收件人邮件信息
-				emailValues.userId = 0;
-				emailValues.accountId = 0;
-				emailValues.type = emailConst.type.RECEIVE;
-				emailValues.status = emailConst.status.NOONE;
+				// 管理员Catch-All：无匹配账户时路由至管理员
+				if (adminAccount) {
+					emailValues.userId = adminAccount.userId;
+					emailValues.accountId = adminAccount.accountId;
+					emailValues.type = emailConst.type.RECEIVE;
+					emailValues.status = emailConst.status.RECEIVE;
+				} else {
+					//设置无收件人邮件信息
+					emailValues.userId = 0;
+					emailValues.accountId = 0;
+					emailValues.type = emailConst.type.RECEIVE;
+					emailValues.status = emailConst.status.NOONE;
 
-				//如果无人收件关闭改为拒收
-				if (noRecipient === settingConst.noRecipient.CLOSE) {
-					emailValues.status = emailConst.status.BOUNCED;
-					emailValues.message = `Recipient not found: <${email}>`;
+					//如果无人收件关闭改为拒收
+					if (noRecipient === settingConst.noRecipient.CLOSE) {
+						emailValues.status = emailConst.status.BOUNCED;
+						emailValues.message = `Recipient not found: <${email}>`;
+					}
 				}
 
 				emailDataList.push(emailValues);
