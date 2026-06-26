@@ -12,12 +12,12 @@
 
 管理员邮箱应作为 **Catch-All（全捕获）** 地址，自动接收发送到该域名（包括子域名）下所有地址的邮件，无需逐一注册。
 
-| 收件地址 | 修复前 | 修复后 |
-|---------|--------|--------|
-| `admin@domain` | ✅ 正常接收 | ✅ 正常接收 |
-| `1@domain`（未注册） | ❌ 被拒绝 | ✅ 路由至管理员 |
-| `1213212@sub.domain`（未注册） | ❌ 被拒绝 | ✅ 路由至管理员 |
-| `registered@domain`（已注册） | ✅ 正常接收 | ✅ 正常接收 |
+| 收件地址 | 修复前 | Catch-All 修复后 | 子域名修复后 |
+|---------|--------|-----------------|-------------|
+| `admin@domain` | ✅ 正常接收 | ✅ 正常接收 | ✅ 正常接收 |
+| `1@domain`（未注册） | ❌ 被拒绝 | ✅ 路由至管理员 | ✅ 路由至管理员 |
+| `1@sub.domain`（未注册） | ❌ 被拒绝 | ❌ 仍被拒绝 | ✅ 路由至管理员 |
+| `registered@domain`（已注册） | ✅ 正常接收 | ✅ 正常接收 | ✅ 正常接收 |
 
 ---
 
@@ -214,6 +214,8 @@ if (account && userRow.email !== env.admin) {
 
 ## 修复后的完整邮件处理流程
 
+### 外部邮件（email.js）
+
 ```
 Cloudflare Email Routing
         │
@@ -246,6 +248,30 @@ Cloudflare Email Routing
 └──────────────────────────────────────┘
 ```
 
+### 内部邮件（email-service.js HandleOnSiteEmail）
+
+```
+用户发送站内邮件
+        │
+        ▼
+┌──────────────────────────────────────┐
+│  判断是否全部为站内邮箱                │
+│  （支持子域名匹配）                    │
+│                                      │
+│  domainList = ["@maindomain.com"]    │
+│                                      │
+│  收件人域名匹配规则：                  │
+│  ├── maindomain.com       → ✅ 精确   │
+│  ├── sub.maindomain.com   → ✅ 子域名  │
+│  ├── a.b.maindomain.com   → ✅ 子域名  │
+│  ├── evil-maindomain.com  → ❌ 不匹配  │
+│  └── otherdomain.com      → ❌ 不匹配  │
+│                                      │
+│  全部站内 → 走 HandleOnSiteEmail      │
+│  存在外站 → 走 Resend/Cloudflare 发送 │
+└──────────────────────────────────────┘
+```
+
 ### 数据库存储示例
 
 当 `1213212@grok1.owaviowa.dpdns.org` 收到邮件时，数据库记录：
@@ -270,6 +296,8 @@ Cloudflare Email Routing
 | 场景 | 权限 | 代码位置 |
 |------|------|----------|
 | 接收未注册地址的邮件 | ✅ Catch-All | `email.js:62-68` |
+| 子域名邮件站内识别 | ✅ 子域名匹配 | `email-service.js:179-186` |
+| 子域名权限检查 | ✅ 子域名匹配 | `role-service.js:157-172` |
 | 跳过域名权限检查 | ✅ 绕过 | `email.js:81` |
 | 跳过发件次数限制 | ✅ 无限制 | `email-service.js:185,200` |
 | 跳过域名发件权限 | ✅ 绕过 | `email-service.js:224` |
@@ -298,6 +326,100 @@ npx wrangler deploy
 
 ---
 
+## 子域名邮件修复（补充）
+
+### 问题描述
+
+主域名的 Catch-All 修复后，子域名的邮件仍然无法被管理员接收。例如：
+
+- `admin@maindomain.com` ✅ 能收到 `1@maindomain.com` 的邮件
+- `admin@maindomain.com` ❌ 收不到 `1@subdomain.maindomain.com` 的邮件
+
+### 根因分析
+
+**文件：`mail-worker/src/service/email-service.js`** 的 `HandleOnSiteEmail` 方法
+
+站内邮件判断使用精确匹配：
+
+```javascript
+// 修复前
+const allInternal = receiveEmail.every(email => {
+    const domain = '@' + emailUtils.getDomain(email);
+    return domainList.includes(domain);  // 精确匹配！
+});
+```
+
+`domainList` = `["@maindomain.com"]`，当发件人是 `user@subdomain.maindomain.com` 时：
+- `domain` = `@subdomain.maindomain.com`
+- `domainList.includes("@subdomain.maindomain.com")` → **false**
+- 邮件被当作**外部邮件**处理 → 没有子域名的 Resend token → 抛出 `noSendProvider` 错误
+
+**文件：`mail-worker/src/service/role-service.js`** 的 `hasAvailDomainPerm` 方法
+
+域名权限检查同样使用精确匹配，导致子域名用户无法通过权限验证。
+
+### 修复 3：子域名站内邮件判断
+
+**文件：`mail-worker/src/service/email-service.js`**
+
+```diff
+- //判断接收方是不是全部为站内邮箱
+- const allInternal = receiveEmail.every(email => {
+-     const domain = '@' + emailUtils.getDomain(email);
+-     return domainList.includes(domain);
+- });
++ //判断接收方是不是全部为站内邮箱（支持子域名匹配）
++ const allInternal = receiveEmail.every(e => {
++     const domain = emailUtils.getDomain(e).toLowerCase();
++     return domainList.some(d => {
++         const baseDomain = d.slice(1).toLowerCase();
++         return domain === baseDomain || domain.endsWith('.' + baseDomain);
++     });
++ });
+```
+
+**关键点：**
+- `domain === baseDomain`：精确匹配主域名
+- `domain.endsWith('.' + baseDomain)`：匹配所有子域名（`sub.maindomain.com`、`a.b.maindomain.com` 等）
+- 前缀 `.` 确保不会误匹配（如 `evil-maindomain.com` 不会匹配 `maindomain.com`）
+
+### 修复 4：子域名权限检查
+
+**文件：`mail-worker/src/service/role-service.js`**
+
+```diff
+  hasAvailDomainPerm(availDomain, email) {
+      availDomain = availDomain.split(',').filter(item => item !== '');
+      if (availDomain.length === 0) {
+          return true
+      }
++     const domain = emailUtils.getDomain(email.toLowerCase());
+      const availIndex = availDomain.findIndex(item => {
+-         const domain = emailUtils.getDomain(email.toLowerCase());
+          const availDomainItem = item.toLowerCase();
+-         return domain === availDomainItem
++         return domain === availDomainItem || domain.endsWith('.' + availDomainItem)
+      })
+      return availIndex > -1
+  },
+```
+
+### 子域名匹配逻辑
+
+```
+配置域名：maindomain.com
+
+匹配结果：
+├── maindomain.com           → ✅ 精确匹配
+├── sub.maindomain.com       → ✅ 子域名匹配
+├── a.b.maindomain.com       → ✅ 深层子域名匹配
+├── evil-maindomain.com      → ❌ 不匹配（前缀无 `.`）
+├── maindomain.com.evil.com  → ❌ 不匹配
+└── otherdomain.com          → ❌ 不匹配
+```
+
+---
+
 ## 注意事项
 
 1. **管理员账户必须存在**：`env.admin` 配置的邮箱必须在系统中已注册为账户，否则 Catch-All 不会生效
@@ -305,3 +427,4 @@ npx wrangler deploy
 3. **`toEmail` 保留原始地址**：管理员可以通过邮件详情中的收件人字段识别邮件原本发送给哪个地址
 4. **转发规则**：Catch-All 邮件的 Telegram/邮箱转发遵循管理员账户的转发设置
 5. **`noRecipient` 设置**：Catch-All 逻辑在 `noRecipient` 检查之前执行，因此无论该设置如何，只要管理员账户存在，邮件都会被接收
+6. **子域名自动支持**：配置主域名后，所有子域名自动获得支持，无需在 `env.domain` 中逐一添加子域名

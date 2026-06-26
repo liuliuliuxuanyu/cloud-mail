@@ -176,10 +176,13 @@ const emailService = {
 		const userRow = await userService.selectById(c, userId);
 		const roleRow = await roleService.selectById(c, userRow.type);
 
-		//判断接收方是不是全部为站内邮箱
-		const allInternal = receiveEmail.every(email => {
-			const domain = '@' + emailUtils.getDomain(email);
-			return domainList.includes(domain);
+		//判断接收方是不是全部为站内邮箱（支持子域名匹配）
+		const allInternal = receiveEmail.every(e => {
+			const domain = emailUtils.getDomain(e).toLowerCase();
+			return domainList.some(d => {
+				const baseDomain = d.slice(1).toLowerCase();
+				return domain === baseDomain || domain.endsWith('.' + baseDomain);
+			});
 		});
 
 		if (c.env.admin !== userRow.email) {
